@@ -244,24 +244,37 @@ trait BasicBackend { self =>
       }
     }
 
-    /** Within a synchronous execution, ensure that a Session is available. */
-    protected[this] final def acquireSession(ctx: Context): Unit =
-      if(!ctx.isPinned) ctx.currentSession = createSession()
+    private[this] abstract class ContextualizedRunnable extends AsyncExecutor.PrioritizedRunnable {
 
-    /** Within a synchronous execution, close the current Session unless it is pinned.
-      *
-      * @param discardErrors If set to true, swallow all non-fatal errors that arise while
-      *        closing the Session. */
-    protected[this] final def releaseSession(ctx: Context, discardErrors: Boolean): Unit =
-      if(!ctx.isPinned) {
-        try ctx.currentSession.close() catch { case NonFatal(ex) if(discardErrors) => }
-        ctx.currentSession = null
-      }
+      /** Within a synchronous execution, ensure that a Session is available. */
+      protected[this] final def acquireSession(ctx: Context): Unit =
+        if(!ctx.isPinned) {
+          try {
+            ctx.currentSession = createSession()
+          } catch { case NonFatal(ex) =>
+            connectionReleased = true
+            throw ex
+          }
+        }
+
+      /** Within a synchronous execution, close the current Session unless it is pinned.
+        *
+        * @param discardErrors If set to true, swallow all non-fatal errors that arise while
+        *        closing the Session. */
+      protected[this] final def releaseSession(ctx: Context, discardErrors: Boolean): Unit =
+        if(!ctx.isPinned) {
+          try ctx.currentSession.close() catch { case NonFatal(ex) if(discardErrors) => }
+          ctx.currentSession = null
+          connectionReleased = true
+          ctx.sync = 0
+        }
+
+    }
 
     /** Run a `SynchronousDatabaseAction` on this database. */
     protected[this] def runSynchronousDatabaseAction[R](a: SynchronousDatabaseAction[R, NoStream, This, _], ctx: Context, continuation: Boolean): Future[R] = {
       val promise = Promise[R]()
-      ctx.getEC(synchronousExecutionContext).prepare.execute(new AsyncExecutor.PrioritizedRunnable {
+      ctx.getEC(synchronousExecutionContext).prepare.execute(new ContextualizedRunnable {
         def priority = {
           ctx.readSync
           ctx.priority(continuation)
@@ -270,18 +283,12 @@ trait BasicBackend { self =>
         def run: Unit =
           try {
             ctx.readSync
-            val res = try {
-              acquireSession(ctx)
-              val res = try a.run(ctx) catch { case NonFatal(ex) =>
-                releaseSession(ctx, true)
-                throw ex
-              }
-              releaseSession(ctx, false)
-              res
-            } finally {
-              if (!ctx.isPinned && ctx.priority(continuation) != WithConnection) connectionReleased = true
-              ctx.sync = 0
+            acquireSession(ctx)
+            val res = try a.run(ctx) catch { case NonFatal(ex) =>
+              releaseSession(ctx, true)
+              throw ex
             }
+            releaseSession(ctx, false)
             promise.success(res)
           } catch { case NonFatal(ex) => promise.tryFailure(ex) }
       })
@@ -298,7 +305,7 @@ trait BasicBackend { self =>
     /** Stream a part of the results of a `SynchronousDatabaseAction` on this database. */
     protected[BasicBackend] def scheduleSynchronousStreaming(a: SynchronousDatabaseAction[_, _ <: NoStream, This, _ <: Effect], ctx: StreamingContext, continuation: Boolean)(initialState: a.StreamState): Unit =
       try {
-        ctx.getEC(synchronousExecutionContext).prepare.execute(new AsyncExecutor.PrioritizedRunnable {
+        ctx.getEC(synchronousExecutionContext).prepare.execute(new ContextualizedRunnable {
           private[this] def str(l: Long) = if(l != Long.MaxValue) l else if(GlobalConfig.unicodeDump) "\u221E" else "oo"
 
           def priority = {
@@ -312,14 +319,7 @@ trait BasicBackend { self =>
               var state = initialState
               ctx.readSync
 
-              if(state eq null) {
-                try {
-                  acquireSession(ctx)
-                } catch { case NonFatal(ex) =>
-                  if (!ctx.isPinned) connectionReleased = true
-                  throw ex
-                }
-              }
+              if(state eq null) acquireSession(ctx)
               var demand = ctx.demandBatch
               var realDemand = if(demand < 0) demand - Long.MinValue else demand
 
@@ -343,16 +343,12 @@ trait BasicBackend { self =>
 
                   if(state eq null) { // streaming finished and cleaned up
                     releaseSession(ctx, true)
-                    if (!ctx.isPinned) connectionReleased = true
-                    ctx.sync = 0
                     ctx.streamingResultPromise.trySuccess(null)
                   }
 
                 } catch { case NonFatal(ex) =>
                   if(state ne null) try a.cancelStream(ctx, state) catch ignoreFollowOnError
                   releaseSession(ctx, true)
-                  if (!ctx.isPinned) connectionReleased = true
-                  ctx.sync = 0
                   throw ex
 
                 } finally {
